@@ -63,6 +63,36 @@ const (
     </interface>
   </devices>
 </domain>`
+
+	domainXMLTemplateKVMNetworkOnly = `<domain type='kvm'>
+  <name>{{.MachineName}}</name> <memory unit='M'>{{.Memory}}</memory>
+  <vcpu>{{.CPU}}</vcpu>
+  <features><acpi/><apic/><pae/></features>
+  <os>
+    <type>hvm</type>
+    <boot dev='cdrom'/>
+    <boot dev='hd'/>
+    <bootmenu enable='no'/>
+  </os>
+  <devices>
+    <disk type='file' device='cdrom'>
+      <source file='{{.ISO}}'/>
+      <target dev='hdc' bus='ide'/>
+      <readonly/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw' cache='{{.CacheMode}}' io='{{.IOMode}}' />
+      <source file='{{.DiskPath}}'/>
+      <target dev='hda' bus='ide'/>
+    </disk>
+    <graphics type='vnc' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+    </graphics>
+    <interface type='network'>
+      <source network='{{.Network}}'/>
+    </interface>
+  </devices>
+</domain>`
 	networkXML = `<network>
   <name>%s</name>
   <ip address='%s' netmask='%s'>
@@ -80,6 +110,7 @@ type Driver struct {
 	DiskSize         int
 	CPU              int
 	Network          string
+	kvmNetworkOnly   bool
 	PrivateNetwork   string
 	ISO              string
 	Boot2DockerURL   string
@@ -133,6 +164,10 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage: "Disk IO mode: threads, native",
 			Value: "threads",
 		},
+		mcnflag.BoolFlag{
+			Name:  "kvm-network-only",
+			Usage: "only use kvm network",
+		},
 		/* Not yet implemented
 		mcnflag.Flag{
 			Name:  "kvm-no-share",
@@ -180,6 +215,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.DiskSize = flags.Int("kvm-disk-size")
 	d.CPU = flags.Int("kvm-cpu-count")
 	d.Network = flags.String("kvm-network")
+	d.kvmNetworkOnly = flags.Bool("kvm-network-only")
 	d.Boot2DockerURL = flags.String("kvm-boot2docker-url")
 	d.CacheMode = flags.String("kvm-cache-mode")
 	d.IOMode = flags.String("kvm-io-mode")
@@ -323,10 +359,14 @@ func (d *Driver) PreCreateCheck() error {
 		log.Warnf("Unable to get libvirt version")
 		return err
 	}
-	err = d.validatePrivateNetwork()
-	if err != nil {
-		return err
+
+	if !d.kvmNetworkOnly {
+		err = d.validatePrivateNetwork()
+		if err != nil {
+			return err
+		}
 	}
+
 	err = d.validateNetwork(d.Network)
 	if err != nil {
 		return err
@@ -372,7 +412,13 @@ func (d *Driver) Create() error {
 	}
 
 	log.Debugf("Defining VM...")
-	tmpl, err := template.New("domain").Parse(domainXMLTemplate)
+
+	domainTemplate := domainXMLTemplate
+	if d.kvmNetworkOnly {
+		domainTemplate = domainXMLTemplateKVMNetworkOnly
+	}
+
+	tmpl, err := template.New("domain").Parse(domainTemplate)
 	if err != nil {
 		return err
 	}
@@ -532,7 +578,7 @@ func (d *Driver) validateVMRef() error {
 
 // This implementation is specific to default networking in libvirt
 // with dnsmasq
-func (d *Driver) getMAC() (string, error) {
+func (d *Driver) getMAC(network string) (string, error) {
 	if err := d.validateVMRef(); err != nil {
 		return "", err
 	}
@@ -547,6 +593,7 @@ func (d *Driver) getMAC() (string, error) {
 	        ...
 	        <interface type='network'>
 	            ...
+	            <source network='networkname'/>
 	            <mac address='52:54:00:d2:3f:ba'/>
 	            ...
 	        </interface>
@@ -575,16 +622,18 @@ func (d *Driver) getMAC() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Always assume the second interface is the one we want
-	if len(dom.Devices.Interfaces) < 2 {
-		return "", fmt.Errorf("VM doesn't have enough network interfaces.  Expected at least 2, found %d",
-			len(dom.Devices.Interfaces))
+
+	for _, interf := range dom.Devices.Interfaces {
+		if interf.Source.Network == network {
+			return interf.Mac.Address, nil
+		}
 	}
-	return dom.Devices.Interfaces[1].Mac.Address, nil
+
+	return "", fmt.Errorf("VM doesn't have network: %s", network)
 }
 
-func (d *Driver) getIPByMACFromLeaseFile(mac string) (string, error) {
-	leaseFile := fmt.Sprintf(dnsmasqLeases, d.PrivateNetwork)
+func (d *Driver) getIPByMACFromLeaseFile(network string, mac string) (string, error) {
+	leaseFile := fmt.Sprintf(dnsmasqLeases, network)
 	data, err := ioutil.ReadFile(leaseFile)
 	if err != nil {
 		log.Debugf("Failed to retrieve dnsmasq leases from %s", leaseFile)
@@ -607,17 +656,17 @@ func (d *Driver) getIPByMACFromLeaseFile(mac string) (string, error) {
 	return "", nil
 }
 
-func (d *Driver) getIPByMacFromSettings(mac string) (string, error) {
+func (d *Driver) getIPByMacFromSettings(network string, mac string) (string, error) {
 	conn, err := d.getConn()
 	if err != nil {
 		return "", err
 	}
-	network, err := conn.LookupNetworkByName(d.PrivateNetwork)
+	nw, err := conn.LookupNetworkByName(network)
 	if err != nil {
 		log.Warnf("Failed to find network: %s", err)
 		return "", err
 	}
-	bridge_name, err := network.GetBridgeName()
+	bridge_name, err := nw.GetBridgeName()
 	if err != nil {
 		log.Warnf("Failed to get network bridge: %s", err)
 		return "", err
@@ -647,7 +696,12 @@ func (d *Driver) getIPByMacFromSettings(mac string) (string, error) {
 
 func (d *Driver) GetIP() (string, error) {
 	log.Debugf("GetIP called for %s", d.MachineName)
-	mac, err := d.getMAC()
+	network := d.PrivateNetwork
+	if d.kvmNetworkOnly {
+		network = d.Network
+	}
+
+	mac, err := d.getMAC(network)
 	if err != nil {
 		return "", err
 	}
@@ -655,9 +709,9 @@ func (d *Driver) GetIP() (string, error) {
 	 * TODO - Figure out what version of libvirt changed behavior and
 	 *        be smarter about selecting which algorithm to use
 	 */
-	ip, err := d.getIPByMACFromLeaseFile(mac)
+	ip, err := d.getIPByMACFromLeaseFile(network, mac)
 	if ip == "" {
-		ip, err = d.getIPByMacFromSettings(mac)
+		ip, err = d.getIPByMacFromSettings(network, mac)
 	}
 	log.Debugf("Unable to locate IP address for MAC %s", mac)
 	return ip, err
@@ -737,6 +791,7 @@ func createDiskImage(dest string, size int, r io.Reader) error {
 func NewDriver(hostName, storePath string) drivers.Driver {
 	return &Driver{
 		PrivateNetwork: privateNetworkName,
+		kvmNetworkOnly: true,
 		BaseDriver: &drivers.BaseDriver{
 			MachineName: hostName,
 			StorePath:   storePath,
